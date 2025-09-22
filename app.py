@@ -1,208 +1,214 @@
-# this code was made by khaidzzzz
 
-from flask import Flask, request, jsonify
 import asyncio
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-from google.protobuf.json_format import MessageToJson
-import binascii
-import aiohttp
-import requests
-import json
-import like_pb2
-import like_count_pb2
-import uid_generator_pb2
 import time
+import httpx
+import json
+import os
 from collections import defaultdict
-from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from cachetools import TTLCache
+from typing import Tuple
+from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
+from google.protobuf import json_format, message
+from google.protobuf.message import Message
+from Crypto.Cipher import AES
+import base64
 
+# === Settings ===
+MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
+MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
+RELEASEVERSION = "OB50"
+USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
+SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EU"}
+
+# === Flask App Setup ===
 app = Flask(__name__)
+CORS(app)
+cache = TTLCache(maxsize=100, ttl=300)
+cached_tokens = defaultdict(dict)
 
-# ✅ Per-key rate limit setup
-KEY_LIMIT = 150
-token_tracker = defaultdict(lambda: [0, time.time()])  # token: [count, last_reset_time]
+# === Helper Functions ===
+def pad(text: bytes) -> bytes:
+    padding_length = AES.block_size - (len(text) % AES.block_size)
+    return text + bytes([padding_length] * padding_length)
 
-def get_today_midnight_timestamp():
-    now = datetime.now()
-    midnight = datetime(now.year, now.month, now.day)
-    return midnight.timestamp()
+def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    aes = AES.new(key, AES.MODE_CBC, iv)
+    return aes.encrypt(pad(plaintext))
 
-def load_tokens(server_name):
-    if server_name == "IND":
-        with open("token_ind.json", "r") as f:
-            return json.load(f)
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        with open("token_br.json", "r") as f:
-            return json.load(f)
+def decode_protobuf(encoded_data: bytes, message_type: message.Message) -> message.Message:
+    instance = message_type()
+    instance.ParseFromString(encoded_data)
+    return instance
+
+async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
+    json_format.ParseDict(json.loads(json_data), proto_message)
+    return proto_message.SerializeToString()
+
+def get_account_credentials(region: str) -> str:
+    r = region.upper()
+    if r == "ME":
+        return "uid=3831627617&password=CAC2F2F3E2F28C5F5944D502CD171A8AAF84361CDC483E94955D6981F1CFF3E3"
+    elif r == "BD":
+        return "uid=3957595605&password=7203510AB3D87E06CE54FC93ABE40D48AA6AEA55E2DEA2D2AA3487CBB20650D7"
+    elif r in {"BR", "US", "SAC", "ME"}:
+        return "uid=3788023112&password=5356B7495AC2AD04C0A483CF234D6E56FB29080AC2461DD51E0544F8D455CC24"
     else:
-        with open("token_bd.json", "r") as f:
-            return json.load(f)
+        return "uid=3301239795&password=DD40EE772FCBD61409BB15033E3DE1B1C54EDA83B75DF0CDD24C34C7C8798475"
 
-def encrypt_message(plaintext):
-    key = b'Yg&tc%DEuh6%Zc^8'
-    iv = b'6oyZDr22E3ychjM%'
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    padded_message = pad(plaintext, AES.block_size)
-    encrypted_message = cipher.encrypt(padded_message)
-    return binascii.hexlify(encrypted_message).decode('utf-8')
+# === Token Generation ===
+async def get_access_token(account: str):
+    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+    payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
+    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/x-www-form-urlencoded"}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, data=payload, headers=headers)
+        data = resp.json()
+        return data.get("access_token", "0"), data.get("open_id", "0")
 
-def create_protobuf_message(user_id, region):
-    message = like_pb2.like()
-    message.uid = int(user_id)
-    message.region = region
-    return message.SerializeToString()
-
-async def send_request(encrypted_uid, token, url):
-    edata = bytes.fromhex(encrypted_uid)
+async def create_jwt(region: str):
+    account = get_account_credentials(region)
+    token_val, open_id = await get_access_token(account)
+    body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
+    proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
+    payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
+    url = "https://loginbp.ggblueshark.com/MajorLogin"
     headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB49"
+        'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
+        'Content-Type': "application/octet-stream", 'Expect': "100-continue",
+        'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=edata, headers=headers) as response:
-            return response.status
-
-async def send_multiple_requests(uid, server_name, url):
-    region = server_name
-    protobuf_message = create_protobuf_message(uid, region)
-    encrypted_uid = encrypt_message(protobuf_message)
-    tasks = []
-    tokens = load_tokens(server_name)
-    for i in range(100):
-        token = tokens[i % len(tokens)]["token"]
-        tasks.append(send_request(encrypted_uid, token, url))
-    results = await asyncio.gather(*tasks)
-    return results
-
-def create_protobuf(uid):
-    message = uid_generator_pb2.uid_generator()
-    message.krishna_ = int(uid)
-    message.teamXdarks = 1
-    return message.SerializeToString()
-
-def enc(uid):
-    protobuf_data = create_protobuf(uid)
-    encrypted_uid = encrypt_message(protobuf_data)
-    return encrypted_uid
-
-def make_request(encrypt, server_name, token):
-    if server_name == "IND":
-        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-
-    edata = bytes.fromhex(encrypt)
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB49"
-    }
-
-    response = requests.post(url, data=edata, headers=headers, verify=False)
-    hex_data = response.content.hex()
-    binary = bytes.fromhex(hex_data)
-    return decode_protobuf(binary)
-
-def decode_protobuf(binary):
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary)
-        return items
-    except Exception as e:
-        print(f"Error decoding Protobuf data: {e}")
-        return None
-
-@app.route('/like', methods=['GET'])
-def handle_requests():
-    uid = request.args.get("uid")
-    server_name = request.args.get("server_name", "").upper()
-    key = request.args.get("key")
-
-    if key != "jenil":
-        return jsonify({"error": "Invalid or missing API key 🔑"}), 403
-
-    if not uid or not server_name:
-        return jsonify({"error": "UID and server_name are required"}), 400
-
-    def process_request():
-        data = load_tokens(server_name)
-        token = data[0]['token']
-        encrypt = enc(uid)
-
-        today_midnight = get_today_midnight_timestamp()
-        count, last_reset = token_tracker[token]
-
-        if last_reset < today_midnight:
-            token_tracker[token] = [0, time.time()]
-            count = 0
-
-        if count >= KEY_LIMIT:
-            return {
-                "error": "Daily request limit reached for this key.",
-                "status": 429,
-                "remains": f"(0/{KEY_LIMIT})"
-            }
-
-        before = make_request(encrypt, server_name, token)
-        jsone = MessageToJson(before)
-        data = json.loads(jsone)
-        before_like = int(data['AccountInfo'].get('Likes', 0))
-
-        # Select URL
-        if server_name == "IND":
-            url = "https://client.ind.freefiremobile.com/LikeProfile"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            url = "https://client.us.freefiremobile.com/LikeProfile"
-        else:
-            url = "https://clientbp.ggblueshark.com/LikeProfile"
-
-        asyncio.run(send_multiple_requests(uid, server_name, url))
-
-        after = make_request(encrypt, server_name, token)
-        jsone = MessageToJson(after)
-        data = json.loads(jsone)
-
-        after_like = int(data['AccountInfo']['Likes'])
-        id = int(data['AccountInfo']['UID'])
-        name = str(data['AccountInfo']['PlayerNickname'])
-
-        like_given = after_like - before_like
-        status = 1 if like_given != 0 else 2
-
-        if like_given > 0:
-            token_tracker[token][0] += 1
-            count += 1
-
-        remains = KEY_LIMIT - count
-
-        result = {
-            "LikesGivenByAPI": like_given,
-            "LikesafterCommand": after_like,
-            "LikesbeforeCommand": before_like,
-            "PlayerNickname": name,
-            "UID": id,
-            "status": status,
-            "remains": f"({remains}/{KEY_LIMIT})"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, data=payload, headers=headers)
+        msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
+        cached_tokens[region] = {
+            'token': f"Bearer {msg.get('token','0')}",
+            'region': msg.get('lockRegion','0'),
+            'server_url': msg.get('serverUrl','0'),
+            'expires_at': time.time() + 25200
         }
-        return result
 
-    result = process_request()
-    return jsonify(result)
+async def initialize_tokens():
+    tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
+    await asyncio.gather(*tasks)
+
+async def refresh_tokens_periodically():
+    while True:
+        await asyncio.sleep(25200)
+        await initialize_tokens()
+
+async def get_token_info(region: str) -> Tuple[str, str, str]:
+    info = cached_tokens.get(region)
+    if info and time.time() < info['expires_at']:
+        return info['token'], info['region'], info['server_url']
+    await create_jwt(region)
+    info = cached_tokens[region]
+    return info['token'], info['region'], info['server_url']
+
+async def get_region_by_uid(uid: str) -> str:
+    """Fetch player region using external API"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"https://xza-get-region.vercel.app/region?uid={uid}")
+        if resp.status_code != 200:
+            raise ValueError("Failed to fetch region")
+        data = resp.json()
+        return data.get("region", "").upper()
+
+async def GetAccountInformation(uid, unk, region, endpoint):
+    payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
+    data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
+    token, lock, server = await get_token_info(region)
+    headers = {
+        'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
+        'Content-Type': "application/octet-stream", 'Expect': "100-continue",
+        'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
+        'ReleaseVersion': RELEASEVERSION
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(server + endpoint, data=data_enc, headers=headers)
+        return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
+
+def format_response(data):
+    return {
+        "AccountInfo": {
+            "AccountAvatarId": data.get("basicInfo", {}).get("headPic"),
+            "AccountBPBadges": data.get("basicInfo", {}).get("badgeCnt"),
+            "AccountBPID": data.get("basicInfo", {}).get("badgeId"),
+            "AccountBannerId": data.get("basicInfo", {}).get("bannerId"),
+            "AccountCreateTime": data.get("basicInfo", {}).get("createAt"),
+            "AccountEXP": data.get("basicInfo", {}).get("exp"),
+            "AccountLastLogin": data.get("basicInfo", {}).get("lastLoginAt"),
+            "AccountLevel": data.get("basicInfo", {}).get("level"),
+            "AccountLikes": data.get("basicInfo", {}).get("liked"),
+            "AccountName": data.get("basicInfo", {}).get("nickname"),
+            "AccountRegion": data.get("basicInfo", {}).get("region"),
+            "AccountSeasonId": data.get("basicInfo", {}).get("seasonId"),
+            "AccountType": data.get("basicInfo", {}).get("accountType"),
+            "BrMaxRank": data.get("basicInfo", {}).get("maxRank"),
+            "BrRankPoint": data.get("basicInfo", {}).get("rankingPoints"),
+            "CsMaxRank": data.get("basicInfo", {}).get("csMaxRank"),
+            "CsRankPoint": data.get("basicInfo", {}).get("csRankingPoints"),
+            "EquippedWeapon": data.get("basicInfo", {}).get("weaponSkinShows", []),
+            "ReleaseVersion": data.get("basicInfo", {}).get("releaseVersion"),
+            "ShowBrRank": data.get("basicInfo", {}).get("showBrRank"),
+            "ShowCsRank": data.get("basicInfo", {}).get("showCsRank"),
+            "Title": data.get("basicInfo", {}).get("title")
+        },
+        "AccountProfileInfo": {
+            "EquippedOutfit": data.get("profileInfo", {}).get("clothes", []),
+            "EquippedSkills": data.get("profileInfo", {}).get("equipedSkills", [])
+        },
+        "GuildInfo": {
+            "GuildCapacity": data.get("clanBasicInfo", {}).get("capacity"),
+            "GuildID": str(data.get("clanBasicInfo", {}).get("clanId")),
+            "GuildLevel": data.get("clanBasicInfo", {}).get("clanLevel"),
+            "GuildMember": data.get("clanBasicInfo", {}).get("memberNum"),
+            "GuildName": data.get("clanBasicInfo", {}).get("clanName"),
+            "GuildOwner": str(data.get("clanBasicInfo", {}).get("captainId"))
+        },
+        "captainBasicInfo": data.get("captainBasicInfo", {}),
+        "creditScoreInfo": data.get("creditScoreInfo", {}),
+        "petInfo": data.get("petInfo", {}),
+        "socialinfo": data.get("socialInfo", {})
+    }
+
+# === API Routes ===
+@app.route('/get')
+async def get_account_info():
+    uid = request.args.get('uid')
+    if not uid:
+        return jsonify({"error": "Please provide UID."}), 400
+    
+    try:
+        # Get region from external API
+        region = await get_region_by_uid(uid)
+        if not region or region not in SUPPORTED_REGIONS:
+            return jsonify({"error": "Invalid region or unsupported region"}), 400
+        
+        # Get account information
+        return_data = await GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow")
+        formatted = format_response(return_data)
+        return jsonify(formatted), 200
+    
+    except Exception as e:
+        return jsonify({"error": "Invalid UID or server error. Please try again."}), 500
+
+@app.route('/refresh', methods=['GET', 'POST'])
+def refresh_tokens_endpoint():
+    try:
+        asyncio.run(initialize_tokens())
+        return jsonify({'message': 'Tokens refreshed for all regions.'}), 200
+    except Exception as e:
+        return jsonify({'error': f'Refresh failed: {e}'}), 500
+
+# === Startup ===
+async def startup():
+    await initialize_tokens()
+    asyncio.create_task(refresh_tokens_periodically())
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(startup())
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
